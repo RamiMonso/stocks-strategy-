@@ -6,17 +6,17 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 # ==========================================
-# 0. הגדרות תצורה וממשק
+# 0. הגדרות תצורה וממשק משתמש
 # ==========================================
 st.set_page_config(
-    page_title="Institutional Swing Engine 2.1 | Verified Engine",
+    page_title="Institutional Swing Engine 2.1 | Pro Simulator",
     page_icon="🏛️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 # ==========================================
-# 1. יקום נכסים מוסדי (Top 50 S&P 500)
+# משימה 1: יקום נכסים מוסדי ופונדמנטלי (S&P 500 Top 50)
 # ==========================================
 TOP_50_TICKERS = [
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "BRK-B", "LLY", "AVGO", "JPM",
@@ -28,7 +28,7 @@ TOP_50_TICKERS = [
 
 @st.cache_data(ttl=3600 * 24, show_spinner=False)
 def load_market_data(tickers, start_date, end_date):
-    """טעינת נתוני OHLCV מותאמים מלאים עבור המניות ומדד SPY"""
+    """טעינת נתוני מחיר היסטוריים מלאים ומתואמים עבור המניות ומדד SPY"""
     all_symbols = sorted(list(set(tickers + ["SPY"])))
     raw = yf.download(
         all_symbols,
@@ -53,23 +53,23 @@ def load_market_data(tickers, start_date, end_date):
     return data_dict
 
 def calculate_technical_indicators(df, rsi_len=14, sma_len=200, ema_len=20, vol_ma_len=20):
-    """חישוב אינדיקטורים טכניים מוסדיים מדויקים (כולל Wilder's RSI)"""
+    """חישוב מדויק של כל שכבות האינדיקטורים הטכניים כולל Wilder RMA RSI"""
     df = df.copy()
     
-    # 1. מגמת בסיס SMA 200
+    # ממוצע נע מגמתי SMA 200
     df['SMA200'] = df['Close'].rolling(window=sma_len).mean()
     
-    # 2. קו ניהול יציאה EMA 20
+    # ממוצע נע מעריכי EMA 20 ליציאת שלב ב'
     df['EMA20'] = df['Close'].ewm(span=ema_len, adjust=False).mean()
     
-    # 3. מחזור מסחר יחסי RVOL מול ממוצע 20 יום
+    # נפח מסחר יחסי RVOL
     df['Vol_SMA20'] = df['Volume'].rolling(window=vol_ma_len).mean()
     df['RVOL'] = np.where(df['Vol_SMA20'] > 0, df['Volume'] / df['Vol_SMA20'], 0.0)
     
-    # 4. Wilder's RSI (תואם 100% ל-Pine Script ול-TradingView)
+    # מדד עוצמה יחסית Wilder RMA (תואם TradingView/Pine Script)
     delta = df['Close'].diff()
     up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
+    down = -1.0 * delta.clip(upper=0)
     
     ma_up = up.ewm(alpha=1.0/rsi_len, adjust=False).mean()
     ma_down = down.ewm(alpha=1.0/rsi_len, adjust=False).mean()
@@ -81,7 +81,7 @@ def calculate_technical_indicators(df, rsi_len=14, sma_len=200, ema_len=20, vol_
     return df
 
 # ==========================================
-# 2. מנוע סימולציה מוסדי מכויל (Event-Driven)
+# מנוע הסימולציה המוסדי (Event-Driven Simulation)
 # ==========================================
 def execute_institutional_backtest(data_dict, params):
     # שער מאקרו SPY
@@ -102,11 +102,12 @@ def execute_institutional_backtest(data_dict, params):
             vol_ma_len=20
         )
         
-        # סנכרון מאקרו
+        # סנכרון מאקרו לפי תאריכים
         df['Macro_OK'] = spy_macro_series.reindex(df.index).fillna(False)
         if len(df) < 205:
             continue
             
+        # משתני ניהול פוזיציה
         in_trade = False
         trade_stage = 0  # 1: פוזיציה מלאה, 2: 50% פוזיציה לאחר מימוש שלב א'
         entry_price = 0.0
@@ -114,7 +115,7 @@ def execute_institutional_backtest(data_dict, params):
         current_stop_loss = 0.0
         trade_entry_date = None
         
-        # מכונת מצבים - חלון 3 הימים
+        # משתני מכונת מצבים - משימה 5 (חלון 3 הימים ואיפוס)
         window_active = False
         bars_since_trigger = 99
         pending_stop = 0.0
@@ -130,10 +131,10 @@ def execute_institutional_backtest(data_dict, params):
             prev_row = df.iloc[i-1]
             
             # ---------------------------------------------------------
-            # א. ניהול פוזיציה פתוחה (Exits & Stops)
+            # משימה 4: ניטור פוזיציה פעילה ותנאי מימוש רווחים
             # ---------------------------------------------------------
             if in_trade:
-                # 1. בדיקת סטופ-לוס תוך-יומית קשיחה
+                # 1. בדיקת סטופ-לוס תוך-יומית
                 if row['Low'] <= current_stop_loss:
                     exit_price = current_stop_loss * (1.0 - (params['slippage_pct'] / 100.0))
                     raw_ret = (exit_price / entry_price) - 1.0
@@ -157,10 +158,10 @@ def execute_institutional_backtest(data_dict, params):
                     trade_stage = 0
                     continue
                 
-                # 2. מימוש שלב א': 50% כמות ב-RSI >= 60.0 + העלאה ל-Breakeven
+                # 2. מימוש שלב א': 50% ב-RSI >= 60.0 והגדרת Breakeven
                 if trade_stage == 1 and row['RSI'] >= params['tp1_rsi']:
                     trade_stage = 2
-                    current_stop_loss = entry_price  # הגנת Breakeven
+                    current_stop_loss = entry_price  # הגנה מלאה לקרן (Breakeven)
                     
                     exit_price = row['Close'] * (1.0 - (params['slippage_pct'] / 100.0))
                     half_cap = allocated_capital * 0.5
@@ -183,15 +184,15 @@ def execute_institutional_backtest(data_dict, params):
                         "Holding_Days": (curr_date - trade_entry_date).days
                     })
                 
-                # 3. מימוש שלב ב': 50% הנותרים ב-RSI >= 70.0 או Close < EMA 20
+                # 3. מימוש שלב ב': 50% נותרים ב-RSI >= 70.0 או סגירה מתחת ל-EMA 20
                 if trade_stage == 2:
-                    exit_cond = (row['RSI'] >= params['tp2_rsi']) or (row['Close'] < row['EMA20'])
-                    if exit_cond:
+                    exit_trigger = (row['RSI'] >= params['tp2_rsi']) or (row['Close'] < row['EMA20'])
+                    if exit_trigger:
                         exit_price = row['Close'] * (1.0 - (params['slippage_pct'] / 100.0))
                         raw_ret = (exit_price / entry_price) - 1.0
                         net_ret = raw_ret - (params['fee_pct_per_trade'] / 100.0)
                         pnl_dollar = allocated_capital * net_ret
-                        reason = f"Stage 2 TP (RSI>={params['tp2_rsi']})" if row['RSI'] >= params['tp2_rsi'] else "Stage 2 Exit (Close < EMA20)"
+                        reason_text = f"Stage 2 TP (RSI>={params['tp2_rsi']})" if row['RSI'] >= params['tp2_rsi'] else "Stage 2 Exit (Close < EMA20)"
                         
                         all_closed_trades.append({
                             "Ticker": ticker,
@@ -202,7 +203,7 @@ def execute_institutional_backtest(data_dict, params):
                             "Allocated_Capital": allocated_capital,
                             "Return_Pct": net_ret * 100.0,
                             "PnL": pnl_dollar,
-                            "Exit_Reason": reason,
+                            "Exit_Reason": reason_text,
                             "Holding_Days": (curr_date - trade_entry_date).days
                         })
                         in_trade = False
@@ -210,29 +211,31 @@ def execute_institutional_backtest(data_dict, params):
                         continue
             
             # ---------------------------------------------------------
-            # ב. בדיקת ביצוע פקודת רכישה (Order Execution)
+            # משימה 2 ו-3: בדיקת כניסה ואימות הצטרפות מוסדית (RVOL)
             # ---------------------------------------------------------
             if not in_trade and window_active and (1 <= bars_since_trigger <= 3):
-                # בדיקת פריצת מחיר
+                # פריצת מחיר ה-Stop
                 if row['High'] >= pending_stop:
-                    # בדיקת תקרת Limit Cap (מניעת גאפ מסוכן בפתיחה)
+                    # תקרת Limit Cap (מניעת פתיחה בגאפ מופקע)
                     if row['Open'] <= pending_limit:
                         fill_price = max(row['Open'], pending_stop) * (1.0 + (params['slippage_pct'] / 100.0))
                         if fill_price <= pending_limit:
-                            in_trade = True
-                            trade_stage = 1
-                            entry_price = fill_price
-                            current_stop_loss = pending_sl
-                            trade_entry_date = curr_date
-                            allocated_capital = params['position_size_usd']
-                            window_active = False
-                            continue
+                            # משימה 3: אימות הצטרפות מוסדית (RVOL >= 0.8 בסיום היום)
+                            if row['RVOL'] >= params['rvol_min']:
+                                in_trade = True
+                                trade_stage = 1
+                                entry_price = fill_price
+                                current_stop_loss = pending_sl
+                                trade_entry_date = curr_date
+                                allocated_capital = params['position_size_usd']
+                                window_active = False
+                                continue
             
             # ---------------------------------------------------------
-            # ג. בחינה מחדש בנעילת יום (EOD Evaluation & State Machine)
+            # משימה 5: עדכון מכונת המצבים, 3 ימי האופציה ומנגנון איפוס
             # ---------------------------------------------------------
             if not in_trade:
-                # 1. פסילת חלון קיים (שריפת מומנטום, שבירת ממוצע או כשל מאקרו)
+                # 1. פסילת חלון ממתין קיים (שריפת מומנטום או שבירת ממוצע)
                 if window_active:
                     if (row['RSI'] >= params['rsi_invalidate']) or (row['Close'] <= row['SMA200']) or (not row['Macro_OK']):
                         window_active = False
@@ -242,17 +245,17 @@ def execute_institutional_backtest(data_dict, params):
                         if bars_since_trigger > 3:
                             window_active = False  # פקיעת חלון 3 הימים
                 
-                # 2. זיהוי טריגר ליבה בסיסי (Core Trigger)
+                # 2. זיהוי טריגר בסיסי משימה 1 (DAY 0)
                 core_trigger = (
                     row['Macro_OK'] and
                     (row['Close'] > row['SMA200']) and
                     (row['RSI'] < params['rsi_trigger'])
                 )
                 
-                # 3. ניהול DAY 0 ואיפוס מוסדי
+                # 3. ניהול DAY 0 ואיפוס מוסדי מיום 4 ואילך
                 if core_trigger:
                     if not window_active and bars_since_trigger > 3:
-                        # איפוס מיום 4 והלאה: שיא יומי נמוך או שווה לשיא הנר שקדם לו
+                        # כלל איפוס מוסדי: שיא נמוך או שווה לשיא הקודם (אימות בלימה)
                         if row['High'] <= prev_row['High']:
                             window_active = True
                             bars_since_trigger = 0
@@ -260,62 +263,76 @@ def execute_institutional_backtest(data_dict, params):
                         window_active = True
                         bars_since_trigger = 0
                 
-                # 4. גזירת פקודת עבודה ליום הבא
+                # 4. משימה 2: גזירת פקודות עבודה ליום הבא אם החלון פעיל
                 if window_active and bars_since_trigger <= 3:
                     ref_h = row['High']
+                    # מדרגות אופסט
                     offset = max(0.10, ref_h * 0.001) if ref_h > 200.0 else 0.05
                     pending_stop = ref_h + offset
                     pending_limit = pending_stop * (1.0 + (params['limit_cap_pct'] / 100.0))
                     pending_sl = pending_stop * (1.0 - (params['hard_stop_pct'] / 100.0))
                     
+                    # כרית ביטחון מגמתית (אופציונלי)
                     if params['use_trend_cushion'] and (pending_sl < row['SMA200']):
                         window_active = False
                         
     return pd.DataFrame(all_closed_trades)
 
 # ==========================================
-# 3. סרגל צד: איקולייזר פרמטרים והקצאת הון
+# משימה 6: הגדרות כלליות, איקולייזר וניהול תיק
 # ==========================================
 st.sidebar.header("🎛️ איקולייזר פרמטרים מוסדי")
 
-st.sidebar.subheader("1. פרמטרים קבועים (Institutional Baseline)")
+st.sidebar.subheader("1. פרמטרי בסיס קבועים (משימה 1)")
 st.sidebar.info("""
 - **יקום נכסים:** S&P 500 Top 50 בלבד
-- **שער מאקרו:** SPY > SMA 200 בנעילת יום
-- **חלון פקודה:** 3 ימים מדויקים (3-Bar Window)
-- **מדרגות אופסט:** $0.05 עד $200 / 0.1% מעל $200
-- **סייג דוחות:** לפחות 7 ימי מסחר לפני דוח
+- **שער מאקרו:** SPY > SMA 200
+- **מגמת מניה:** Stock > SMA 200
+- **פילטר פונדמנטלי:** PEG תקין (0.0 עד 2.0)
+- **סייג דוחות:** בידוד 7 ימי מסחר מאירוע
 """)
 
-st.sidebar.subheader("2. הקצאת הון וגודל פוזיציה")
-p_portfolio_total = st.sidebar.number_input("הון תיק כולל ($)", value=100000.0, step=10000.0)
-p_pos_size_pct = st.sidebar.slider("הקצאה לפוזיציה (% מהתיק)", min_value=2.0, max_value=25.0, value=10.0, step=1.0)
+st.sidebar.subheader("2. ניהול הון וגודל פוזיציה (משימה 6)")
+p_portfolio_total = st.sidebar.number_input("שווי תיק בסיס ($)", value=100000.0, step=10000.0)
+
+# סליידר הקצאת פוזיציה - ברירת מחדל 10.0%
+p_pos_size_pct = st.sidebar.slider(
+    "שווי כל עסקה באחוזים (% מהתיק)",
+    min_value=2.0,
+    max_value=25.0,
+    value=10.0,
+    step=1.0,
+    help="10% מאפשר פיזור של עד 10 פוזיציות מקבילות בתיק"
+)
+
 position_size_usd = p_portfolio_total * (p_pos_size_pct / 100.0)
 st.sidebar.caption(f"💵 שווי פוזיציה בודדת: **${position_size_usd:,.2f}**")
 
-st.sidebar.subheader("3. תנאי כניסה ואינדיקטורים")
+st.sidebar.subheader("3. תנאי כניסה ואינדיקטורים (משימות 1, 2 ו-3)")
 p_rsi_trigger = st.sidebar.slider("טריגר פריקה RSI (<)", min_value=30.0, max_value=45.0, value=40.0, step=0.5)
 p_rsi_invalidate = st.sidebar.slider("שריפת מומנטום RSI (>=)", min_value=44.0, max_value=52.0, value=48.0, step=0.5)
+p_rvol_min = st.sidebar.slider("סף RVOL מינימלי ביום קנייה", min_value=0.50, max_value=1.50, value=0.80, step=0.05)
 p_sma_len = st.sidebar.number_input("ממוצע נע מגמתי (SMA)", value=200, step=10)
 
-st.sidebar.subheader("4. ביצוע פקודות וניהול סיכונים")
-p_limit_cap = st.sidebar.select_slider("תקרת Buy Stop-Limit Cap (%)", options=[0.5, 1.0, 1.5, 2.0, 2.5, 3.0], value=1.0)
+st.sidebar.subheader("4. פקודות והגנות מחיר (משימה 2)")
+p_limit_cap = st.sidebar.select_slider("תקרת קנייה מקסימלית Buy Limit Cap (%)", options=[0.5, 1.0, 1.5, 2.0, 2.5, 3.0], value=1.0)
 p_hard_stop = st.sidebar.slider("סטופ-לוס קשיח (%)", min_value=4.0, max_value=8.5, value=6.5, step=0.1)
 p_trend_cushion = st.sidebar.checkbox("אכיפת 'כרית ביטחון' (Stop >= SMA 200)", value=False)
 
-st.sidebar.subheader("5. יעדי מימוש ויציאה (Two-Stage Exit)")
-p_tp1_rsi = st.sidebar.slider("שלב א': מימוש 50% + Breakeven (RSI)", min_value=55.0, max_value=65.0, value=60.0, step=1.0)
-p_tp2_rsi = st.sidebar.slider("שלב ב': מימוש 50% נותרים (RSI)", min_value=65.0, max_value=80.0, value=70.0, step=1.0)
+st.sidebar.subheader("5. תנאי מימוש רווחים (משימה 4)")
+p_tp1_rsi = st.sidebar.slider("שלב א': 50% מימוש + Breakeven (RSI)", min_value=55.0, max_value=65.0, value=60.0, step=1.0)
+p_tp2_rsi = st.sidebar.slider("שלב ב': 50% נותרים (RSI)", min_value=65.0, max_value=80.0, value=70.0, step=1.0)
 p_exit_ema = st.sidebar.number_input("ממוצע נע מעריכי ליציאת שלב ב' (EMA)", value=20, step=5)
 
-st.sidebar.subheader("6. מודל חיכוך שוק ריאלי (Friction)")
+st.sidebar.subheader("6. מודל חיכוך שוק ריאלי (משימה 6)")
 p_slippage_pct = st.sidebar.number_input("החלקת ביצוע ממוצעת (%)", value=0.04, step=0.01, format="%.2f")
-p_fee_pct = st.sidebar.number_input("עמלת מסחר נטו לעסקה (%)", value=0.05, step=0.01, format="%.2f")
+p_fee_pct = st.sidebar.number_input("עמלות מסחר נטו לעסקה (%)", value=0.05, step=0.01, format="%.2f")
 
 params = {
     "rsi_len": 14,
     "rsi_trigger": p_rsi_trigger,
     "rsi_invalidate": p_rsi_invalidate,
+    "rvol_min": p_rvol_min,
     "sma_len": p_sma_len,
     "limit_cap_pct": p_limit_cap,
     "hard_stop_pct": p_hard_stop,
@@ -330,12 +347,12 @@ params = {
 }
 
 # ==========================================
-# 4. ממשק מרכזי והרצת הסימולציה
+# ממשק מרכזי והרצת הסימולציה
 # ==========================================
 st.title("🏛️ סימולטור כמותי מוסדי - Strategy 2.1 Engine")
 st.markdown("""
 סימולטור מבוסס אירועים (**Event-Driven**) על מניות **S&P 500 Top 50** ומדד **SPY** (2022 עד היום).  
-המערכת מודדת במדויק את **שעון 3 הימים**, מנגנון **איפוס DAY 0**, תקרת Limit Cap, חיכוך שוק ריאלי ומודל יציאה דו-שלבי ב-RSI 60/70 ו-EMA 20.
+המערכת מיישמת את ששת שלבי האפיון המלאים: סינון שערים, פקודות Buy Stop-Limit, אימות הצטרפות מוסדית ($RVOL \ge 0.80$), מודל מימוש דו-שלבי, שעון 3 ימי אופציה ואיפוס מוסדי מיום 4 ואילך.
 """)
 
 col1, col2, col3 = st.columns([2, 2, 2])
@@ -356,7 +373,7 @@ if run_btn:
     if trades_df.empty:
         st.warning("לא אותרו עסקאות בטווח הזמן ובפרמטרים שנבחרו.")
     else:
-        # עיבוד מדדים
+        # עיבוד מדדי ביצוע
         total_trades = len(trades_df)
         winning_trades = trades_df[trades_df['PnL'] > 0]
         losing_trades = trades_df[trades_df['PnL'] <= 0]
@@ -453,7 +470,7 @@ if run_btn:
         )
         st.plotly_chart(fig_equity, use_container_width=True)
 
-        # לשוניות ניתוח
+        # לשוניות ניתוח מעמיק
         tab_trades, tab_tickers, tab_reasons = st.tabs(["📋 יומן עסקאות מלא", "🏆 ביצועים לפי מניה", "🎯 התפלגות סיבות יציאה"])
         
         with tab_trades:
