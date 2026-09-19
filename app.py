@@ -1,515 +1,469 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import yfinance as yf
-import plotly.graph_objects as go
-from datetime import datetime, timedelta
+"""
+סימולטור אסטרטגיית פולבק RSI - Streamlit
+הרצה מקומית:  streamlit run app.py
+"""
+from __future__ import annotations
 
-# =====================================================================
-# 0. הגדרות תצורה וממשק Streamlit
-# =====================================================================
-st.set_page_config(
-    page_title="Institutional Swing Engine 2.1 | Portfolio Simulator",
-    page_icon="🏛️",
-    layout="wide",
-    initial_sidebar_state="expanded"
+import datetime as dt
+import json
+import time
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from plotly.subplots import make_subplots
+
+from simulator import data as D
+from simulator.engine import Dataset, Params, run_backtest
+from simulator.portfolio import cash_rate_series, curve_metrics, simulate_portfolio, trade_stats, yearly_table
+
+st.set_page_config(page_title="סימולטור פולבק RSI", page_icon="📈", layout="wide")
+st.markdown(
+    """
+<style>
+.stMarkdown, .stAlert, label, [data-testid="stMetric"], .stCaption, summary { direction: rtl; text-align: right; }
+[data-testid="stSidebar"] label { direction: rtl; text-align: right; }
+.stTabs [data-baseweb="tab-list"] { direction: rtl; }
+</style>
+""",
+    unsafe_allow_html=True,
 )
 
-# =====================================================================
-# משימה 1: יקום הנכסים (S&P 500 Top 50)
-# =====================================================================
-TOP_50_TICKERS = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "BRK-B", "LLY", "AVGO", "JPM",
-    "TSLA", "UNH", "V", "XOM", "MA", "JNJ", "PG", "HD", "COST", "MRK",
-    "ABBV", "CVX", "CRM", "BAC", "WMT", "AMD", "PEP", "KO", "NFLX", "TMO",
-    "LIN", "ADBE", "WFC", "DIS", "QCOM", "CSCO", "INTU", "GE", "AMAT", "TXN",
-    "CAT", "VZ", "PFE", "PM", "IBM", "CMCSA", "NOW", "INTC", "SPGI", "HON"
-]
+# --------------------------------------------------------------------------------------
+# Defaults, presets and widget-state handling
+# --------------------------------------------------------------------------------------
+DEFAULTS = Params().to_dict()
+DEFAULTS.update(
+    start_d=dt.date(2021, 9, 20),
+    end_d=dt.date(2026, 9, 18),
+    pool_rank=90,
+    custom_tickers="AAPL, MSFT, NVDA, AMZN, GOOGL, META, JPM, XOM, JNJ, V",
+    use_split=False,
+    split_d=dt.date(2024, 1, 2),
+    preset="— בחר —",
+)
 
-@st.cache_data(ttl=3600 * 24, show_spinner=False)
-def load_all_market_data(tickers, start_date, end_date):
-    """טעינת נתונים היסטוריים מתואמים ומלאים עבור המניות ומדד הייחוס SPY"""
-    symbols = sorted(list(set(tickers + ["SPY"])))
-    raw = yf.download(
-        symbols,
-        start=start_date,
-        end=end_date,
-        auto_adjust=True,
-        group_by='ticker',
-        progress=False
-    )
-    
-    data_dict = {}
-    for sym in symbols:
-        try:
-            if len(symbols) > 1:
-                df = raw[sym].dropna().copy()
-            else:
-                df = raw.dropna().copy()
-            if not df.empty and len(df) > 200:
-                data_dict[sym] = df
-        except Exception:
-            continue
-    return data_dict
+T2 = dict(use_rvol=False, earnings_days=30, stop_mode="none", tp1_rsi=50.0, tp2_rsi=60.0)
+PRESETS = {
+    "האסטרטגיה המקורית (כפי שהוגדרה)": {},
+    "T2 – יציאות RSI 50/60, בלי סטופ ובלי RVOL, טופ 50": dict(T2, top_n=50),
+    "T2 טופ 100, 10% לפוזיציה (כמו בסיכום)": dict(T2, top_n=100, position_pct=10.0, max_positions=10, cost_bps=5.0),
+    "T1 – יציאות RSI 60/70, בלי סטופ ובלי RVOL": dict(use_rvol=False, earnings_days=30, stop_mode="none", top_n=50),
+}
 
-def calculate_technical_indicators(df, rsi_len=14, sma_len=200, ema_len=20, vol_len=20):
-    """חישוב מדדי ניתוח טכני ברמת דיוק מוסדית כולל Wilder's RMA RSI"""
-    df = df.copy()
-    
-    # מגמה ראשית SMA 200 ומגמה מהירה EMA 20
-    df['SMA200'] = df['Close'].rolling(window=sma_len).mean()
-    df['EMA20'] = df['Close'].ewm(span=ema_len, adjust=False).mean()
-    
-    # נפח מסחר יחסי RVOL
-    df['Vol_SMA20'] = df['Volume'].rolling(window=vol_len).mean()
-    df['RVOL'] = np.where(df['Vol_SMA20'] > 0, df['Volume'] / df['Vol_SMA20'], 0.0)
-    
-    # חישוב RSI(14) לפי Wilder RMA המקורי
-    delta = df['Close'].diff()
-    gain = delta.clip(lower=0)
-    loss = -1.0 * delta.clip(upper=0)
-    
-    avg_gain = gain.ewm(alpha=1.0 / rsi_len, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / rsi_len, adjust=False).mean()
-    
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    df['RSI'] = 100.0 - (100.0 / (1.0 + rs))
-    df['RSI'] = df['RSI'].fillna(50.0)
-    
-    return df
+for k, v in DEFAULTS.items():
+    st.session_state.setdefault(k, v)
+st.session_state.setdefault("history", [])
+st.session_state.setdefault("result", None)
 
-@st.cache_data(ttl=3600 * 24, show_spinner=False)
-def fetch_earnings_calendar(tickers):
-    """משיכת לוחות דוחות כספיים לצורך סייג 7 ימי מסחר"""
-    earnings_dict = {}
-    for t in tickers:
-        try:
-            tk = yf.Ticker(t)
-            ed = tk.get_earnings_dates(limit=40)
-            if ed is not None and not ed.empty:
-                earnings_dict[t] = ed.index.tz_localize(None).normalize()
-            else:
-                earnings_dict[t] = pd.to_datetime([])
-        except Exception:
-            earnings_dict[t] = pd.to_datetime([])
-    return earnings_dict
 
-def is_blackout_period(trade_date, earnings_dates):
-    """בדיקה האם הנר נמצא בטווח 7 ימי מסחר (כ-10 ימים קלנדריים) לפני דוח"""
-    for ed in earnings_dates:
-        delta = (ed - trade_date).days
-        if 0 <= delta <= 10:
-            return True
-    return False
+def apply_preset():
+    name = st.session_state.get("preset")
+    if name in PRESETS:
+        st.session_state.update({**{k: v for k, v in DEFAULTS.items() if k in Params().to_dict()}, **PRESETS[name]})
 
-# =====================================================================
-# מנוע הסימולציה המוסדי ברמת תיק (Portfolio-Level State Machine)
-# =====================================================================
-def run_portfolio_simulation(data_dict, earnings_dict, params):
-    # שער מאקרו SPY
-    spy_df = calculate_technical_indicators(data_dict["SPY"], sma_len=params["sma_len"])
-    spy_macro = spy_df['Close'] > spy_df['SMA200']
-    
-    # הכנת נתוני כל המניות
-    processed_stocks = {}
-    for ticker, raw_df in data_dict.items():
-        if ticker == "SPY":
-            continue
-        df = calculate_technical_indicators(
-            raw_df,
-            rsi_len=params["rsi_len"],
-            sma_len=params["sma_len"],
-            ema_len=params["exit_ema"],
-            vol_len=20
-        )
-        df['Macro_OK'] = spy_macro.reindex(df.index).fillna(False)
-        e_dates = earnings_dict.get(ticker, pd.to_datetime([]))
-        df['Near_Earnings'] = [is_blackout_period(d, e_dates) for d in df.index]
-        
-        # שער טריגר בסיסי משימה 1
-        df['Core_Trigger'] = (
-            df['Macro_OK'] &
-            (df['Close'] > df['SMA200']) &
-            (df['RSI'] < params['rsi_trigger']) &
-            (~df['Near_Earnings'])
-        )
-        processed_stocks[ticker] = df
 
-    # איחוד כל תאריכי המסחר מ-2022
-    all_dates = sorted(list(set.union(*[set(df.loc[df.index >= params['start_date']].index) for df in processed_stocks.values()])))
-    
-    # מצב תיק כולל
-    cash = params['initial_capital']
-    max_positions = int(100.0 / params['pos_size_pct'])
-    allocated_per_position = params['initial_capital'] * (params['pos_size_pct'] / 100.0)
-    
-    open_positions = {}  # ticker: dict
-    pending_orders = {}  # ticker: dict
-    closed_trades = []
-    daily_equity_history = []
-    
-    for curr_date in all_dates:
-        # -------------------------------------------------------------
-        # 1. ניטור פוזיציות פעילות (סטופ לוס, מימוש א', מימוש ב')
-        # -------------------------------------------------------------
-        active_tickers = list(open_positions.keys())
-        for ticker in active_tickers:
-            pos = open_positions[ticker]
-            df = processed_stocks[ticker]
-            if curr_date not in df.index:
-                continue
-            row = df.loc[curr_date]
-            
-            entry_p = pos['entry_price']
-            stage = pos['stage']
-            cur_sl = pos['stop_loss']
-            
-            # בדיקת פגיעה בסטופ-לוס (תוך-יומי מול Low)
-            if row['Low'] <= cur_sl:
-                exit_p = cur_sl * (1.0 - (params['slippage_pct'] / 100.0))
-                net_ret = (exit_p / entry_p - 1.0) - (params['fee_pct'] / 100.0)
-                freed_cap = pos['remaining_capital']
-                pnl = freed_cap * net_ret
-                cash += (freed_cap + pnl)
-                
-                reason = "Hard Stop (-6.5%)" if stage == 1 else "Breakeven Stop (Stage 2)"
-                closed_trades.append({
-                    "Ticker": ticker, "Entry_Date": pos['entry_date'], "Exit_Date": curr_date,
-                    "Stage": f"Exit at Stage {stage}", "Entry_P": entry_p, "Exit_P": exit_p,
-                    "Return_%": net_ret * 100.0, "PnL_$": pnl, "Reason": reason,
-                    "Days": (curr_date - pos['entry_date']).days
-                })
-                del open_positions[ticker]
-                continue
-            
-            # מימוש שלב א': RSI >= 60 (50% כמות והעלאה ל-Breakeven)
-            if stage == 1 and row['RSI'] >= params['tp1_rsi']:
-                pos['stage'] = 2
-                pos['stop_loss'] = entry_p  # Breakeven
-                
-                exit_p = row['Close'] * (1.0 - (params['slippage_pct'] / 100.0))
-                half_cap = pos['remaining_capital'] * 0.5
-                pos['remaining_capital'] -= half_cap
-                
-                net_ret = (exit_p / entry_p - 1.0) - (params['fee_pct'] / 100.0)
-                pnl = half_cap * net_ret
-                cash += (half_cap + pnl)
-                
-                closed_trades.append({
-                    "Ticker": ticker, "Entry_Date": pos['entry_date'], "Exit_Date": curr_date,
-                    "Stage": "Stage 1 (50% TP)", "Entry_P": entry_p, "Exit_P": exit_p,
-                    "Return_%": net_ret * 100.0, "PnL_$": pnl,
-                    "Reason": f"RSI 60 TP (RSI={row['RSI']:.1f})", "Days": (curr_date - pos['entry_date']).days
-                })
-                
-            # מימוש שלב ב': RSI >= 70 או Close < EMA 20
-            if stage == 2:
-                if (row['RSI'] >= params['tp2_rsi']) or (row['Close'] < row['EMA20']):
-                    exit_p = row['Close'] * (1.0 - (params['slippage_pct'] / 100.0))
-                    net_ret = (exit_p / entry_p - 1.0) - (params['fee_pct'] / 100.0)
-                    freed_cap = pos['remaining_capital']
-                    pnl = freed_cap * net_ret
-                    cash += (freed_cap + pnl)
-                    
-                    reason = "RSI 70 TP" if row['RSI'] >= params['tp2_rsi'] else "Close < EMA20"
-                    closed_trades.append({
-                        "Ticker": ticker, "Entry_Date": pos['entry_date'], "Exit_Date": curr_date,
-                        "Stage": "Stage 2 (Final)", "Entry_P": entry_p, "Exit_P": exit_p,
-                        "Return_%": net_ret * 100.0, "PnL_$": pnl, "Reason": reason,
-                        "Days": (curr_date - pos['entry_date']).days
-                    })
-                    del open_positions[ticker]
-                    continue
-        
-        # -------------------------------------------------------------
-        # 2. בדיקת ביצוע פקודות Buy Stop-Limit ממתינות
-        # -------------------------------------------------------------
-        eligible_fills = []
-        pending_tickers = list(pending_orders.keys())
-        
-        for ticker in pending_tickers:
-            if ticker in open_positions:
-                del pending_orders[ticker]
-                continue
-                
-            p_order = pending_orders[ticker]
-            p_order['bars_active'] += 1
-            df = processed_stocks[ticker]
-            if curr_date not in df.index:
-                continue
-            row = df.loc[curr_date]
-            
-            # בדיקת תנאי פריצה תוך-יומית
-            if row['High'] >= p_order['buy_stop']:
-                if row['Open'] <= p_order['limit_cap']:
-                    fill_p = max(row['Open'], p_order['buy_stop']) * (1.0 + (params['slippage_pct'] / 100.0))
-                    if fill_p <= p_order['limit_cap']:
-                        # אימות הצטרפות מוסדית: RVOL >= סף מינימום בסיום היום
-                        if row['RVOL'] >= params['rvol_min']:
-                            eligible_fills.append({
-                                "ticker": ticker,
-                                "fill_price": fill_p,
-                                "initial_sl": p_order['initial_sl'],
-                                "rvol": row['RVOL'],
-                                "rsi": row['RSI']
-                            })
-                            del pending_orders[ticker]
-                            continue
-            
-            # פקיעת חלון 3 ימים או ביטול עקב שריפת מומנטום / שבירת מגמה
-            if (p_order['bars_active'] >= 3) or (row['RSI'] >= params['rsi_invalidate']) or (row['Close'] <= row['SMA200']) or (not row['Macro_OK']):
-                del pending_orders[ticker]
+UNIVERSE_LABELS = {
+    "pit_top_n": "טופ N לפי שווי שוק בכל יום (נקודתי, מומלץ)",
+    "static_top_n": "טופ N לפי שווי שוק היום (קבוע; הטיית הסתכלות קדימה)",
+    "custom": "רשימת מניות שאבחר",
+}
 
-        # הקצאת הון לפקודות שנתפסו לפי קיבולת התיק
-        for fill in eligible_fills:
-            t = fill['ticker']
-            if len(open_positions) < max_positions and cash >= allocated_per_position:
-                cash -= allocated_per_position
-                open_positions[t] = {
-                    "entry_date": curr_date,
-                    "entry_price": fill['fill_price'],
-                    "stage": 1,
-                    "stop_loss": fill['initial_sl'],
-                    "remaining_capital": allocated_per_position
-                }
-        
-        # -------------------------------------------------------------
-        # 3. סריקת נרות DAY 0 בנעילת יום והגדרת פקודות חדשות / איפוס
-        # -------------------------------------------------------------
-        for ticker, df in processed_stocks.items():
-            if ticker in open_positions or ticker in pending_orders:
-                continue
-            if curr_date not in df.index:
-                continue
-            idx = df.index.get_loc(curr_date)
-            if idx < 201:
-                continue
-                
-            row = df.iloc[idx]
-            prev_row = df.iloc[idx - 1]
-            
-            if row['Core_Trigger']:
-                ref_h = row['High']
-                offset = max(0.10, ref_h * 0.001) if ref_h > 200.0 else 0.05
-                b_stop = ref_h + offset
-                l_cap = b_stop * (1.0 + (params['limit_cap_pct'] / 100.0))
-                i_sl = b_stop * (1.0 - (params['hard_stop_pct'] / 100.0))
-                
-                # כרית ביטחון מגמתית (אופציונלי)
-                if params['use_trend_cushion'] and (i_sl < row['SMA200']):
-                    continue
-                    
-                pending_orders[ticker] = {
-                    "setup_date": curr_date,
-                    "buy_stop": b_stop,
-                    "limit_cap": l_cap,
-                    "initial_sl": i_sl,
-                    "bars_active": 0
-                }
-        
-        # חישוב שווי התיק היומי (Mark-to-Market)
-        current_positions_value = 0.0
-        for t, pos in open_positions.items():
-            c_price = processed_stocks[t].loc[curr_date, 'Close']
-            unrealized_ret = (c_price / pos['entry_price']) - 1.0
-            current_positions_value += pos['remaining_capital'] * (1.0 + unrealized_ret)
-            
-        total_day_equity = cash + current_positions_value
-        daily_equity_history.append({"Date": curr_date, "Equity": total_day_equity})
 
-    return pd.DataFrame(closed_trades), pd.DataFrame(daily_equity_history)
+def params_from_state() -> Params:
+    s = st.session_state
+    d = {k: s[k] for k in Params().to_dict().keys()}
+    d["start"] = s["start_d"].isoformat()
+    d["end"] = s["end_d"].isoformat()
+    return Params(**d)
 
-# =====================================================================
-# משימה 6: ממשק איקולייזר וניהול פרמטרים ב-Sidebar
-# =====================================================================
-st.sidebar.header("🎛️ איקולייזר מוסדי | Strategy 2.1")
 
-st.sidebar.subheader("1. מבנה התיק והקצאות (Portfolio Rules)")
-p_capital = st.sidebar.number_input("שווי תיק בסיס ($)", value=100000.0, step=10000.0)
-p_pos_size = st.sidebar.slider("הקצאה לכל עסקה (% מהתיק)", min_value=2.0, max_value=25.0, value=10.0, step=1.0)
-st.sidebar.caption(f"סך פוזיציות מקבילות מקסימלי: **{int(100.0 / p_pos_size)}** | ${p_capital * (p_pos_size / 100.0):,.0f} לעסקה")
+# --------------------------------------------------------------------------------------
+# Cached data loaders (shared across reruns; heavy on first run only)
+# --------------------------------------------------------------------------------------
+END_STR = (dt.date.today() + dt.timedelta(days=1)).isoformat()
+CACHE_TTL = 12 * 3600
 
-st.sidebar.subheader("2. תנאי כניסה ואינדיקטורים")
-p_rsi_trig = st.sidebar.slider("טריגר פריקה RSI (<)", min_value=30.0, max_value=45.0, value=40.0, step=0.5)
-p_rsi_inval = st.sidebar.slider("שריפת מומנטום RSI (>=)", min_value=44.0, max_value=55.0, value=48.0, step=0.5)
-p_rvol_min = st.sidebar.slider("סף RVOL מינימלי ביום כניסה", min_value=0.50, max_value=1.50, value=0.80, step=0.05)
-p_sma_len = st.sidebar.number_input("ממוצע נע מגמתי (SMA)", value=200, step=10)
 
-st.sidebar.subheader("3. הגנת פקודות וכרית ביטחון")
-p_limit_cap = st.sidebar.select_slider("תקרת Limit Cap מעל ה-Stop (%)", options=[0.5, 1.0, 1.5, 2.0], value=1.0)
-p_hard_stop = st.sidebar.slider("סטופ-לוס קשיח התחלתי (%)", min_value=4.0, max_value=8.0, value=6.5, step=0.1)
-p_trend_cushion = st.sidebar.checkbox("אכיפת 'כרית ביטחון' (Stop > SMA 200)", value=False)
+@st.cache_resource(show_spinner=False)
+def _store() -> dict:
+    """Process-wide memo table. (We avoid @st.cache_* on the loaders because they call st.progress via callbacks,
+    and Streamlit would try to replay those UI elements on a cache hit.)"""
+    return {}
 
-st.sidebar.subheader("4. תנאי מימוש רווחים")
-p_tp1_rsi = st.sidebar.slider("שלב א': 50% מימוש + Breakeven (RSI)", min_value=55.0, max_value=65.0, value=60.0, step=1.0)
-p_tp2_rsi = st.sidebar.slider("שלב ב': 50% נותרים (RSI)", min_value=65.0, max_value=80.0, value=70.0, step=1.0)
-p_exit_ema = st.sidebar.number_input("ממוצע מעריכי ליציאת שארית (EMA)", value=20, step=5)
 
-st.sidebar.subheader("5. חיכוך שוק ריאלי")
-p_slip = st.sidebar.number_input("החלקת ביצוע ממוצעת (%)", value=0.04, step=0.01, format="%.2f")
-p_fee = st.sidebar.number_input("עמלות מסחר נטו לעסקה (%)", value=0.05, step=0.01, format="%.2f")
+def memo(key, fn):
+    store = _store()
+    hit = store.get(key)
+    if hit is not None and time.time() - hit[0] < CACHE_TTL:
+        return hit[1]
+    val = fn()
+    store[key] = (time.time(), val)
+    return val
 
-# =====================================================================
-# מסך ראשי והרצה
-# =====================================================================
-st.title("🏛️ סימולטור כמותי מוסדי - Strategy 2.1 Full Portfolio")
-st.markdown("""
-סימולציית תיק מלאה מבוססת אירועים (**Event-Driven**) על מניות **S&P 500 Top 50** ומדד **SPY**.  
-כל ששת שלבי האפיון נאכפים במלואם: שער מאקרו, שער מגמה, סייג דוחות 7 ימים, פקודות Buy Stop-Limit עם מדרגות אופסט, אימות מוסדי ($RVOL \ge 0.80$), שעון 3 ימים, איפוס מוסדי ומודל מימוש דו-שלבי.
-""")
 
-col1, col2, col3 = st.columns([2, 2, 2])
-with col1:
-    start_d = st.date_input("תאריך התחלה", datetime(2022, 1, 1))
-with col2:
-    end_d = st.date_input("תאריך סיום", datetime(2026, 9, 18))
-with col3:
-    st.write("")
-    st.write("")
-    run_button = st.button("🚀 הרץ סימולציית תיק מלאה", type="primary", use_container_width=True)
+def cached_bench():
+    return memo(("bench", END_STR), lambda: D.download_benchmarks(D.DATA_START, END_STR))
 
-if run_button:
-    sim_params = {
-        "start_date": pd.to_datetime(start_d),
-        "rsi_len": 14,
-        "rsi_trigger": p_rsi_trig,
-        "rsi_invalidate": p_rsi_inval,
-        "rvol_min": p_rvol_min,
-        "sma_len": p_sma_len,
-        "limit_cap_pct": p_limit_cap,
-        "hard_stop_pct": p_hard_stop,
-        "use_trend_cushion": p_trend_cushion,
-        "tp1_rsi": p_tp1_rsi,
-        "tp2_rsi": p_tp2_rsi,
-        "exit_ema": p_exit_ema,
-        "initial_capital": p_capital,
-        "pos_size_pct": p_pos_size,
-        "slippage_pct": p_slip,
-        "fee_pct": p_fee
-    }
-    
-    with st.spinner("טוען נתוני עומק מתואמים, מסנכרן לוחות דוחות ומריץ סימולציית תיק מלאה..."):
-        m_data = load_all_market_data(TOP_50_TICKERS, pd.to_datetime(start_d) - timedelta(days=365), pd.to_datetime(end_d))
-        e_data = fetch_earnings_calendar(TOP_50_TICKERS)
-        trades_df, equity_df = run_portfolio_simulation(m_data, e_data, sim_params)
-        
-    if trades_df.empty:
-        st.warning("לא אותרו עסקאות בטווח הזמן ובפרמטרים שנבחרו.")
+
+def cached_sp500():
+    return memo(("sp500",), D.get_sp500_tickers)
+
+
+def cached_prices(tickers: tuple, start: str, progress=None):
+    return memo(("prices", tickers, start), lambda: D.download_prices(tickers, start, END_STR, progress=progress))
+
+
+def cached_meta(tickers: tuple, progress=None):
+    return memo(("meta", tickers), lambda: D.download_meta(tickers, progress=progress))
+
+
+def cached_peg(tickers: tuple):
+    return memo(("peg", tickers), lambda: D.download_peg(tickers))
+
+
+def cached_universe(pool_rank: int, progress=None):
+    """S&P 500 -> candidate pool -> point-in-time market-cap ranks."""
+    def build():
+        tickers = tuple(cached_sp500())
+        prices_all = cached_prices(tickers, D.DATA_START, progress=progress)
+        pool = tuple(D.select_pool(prices_all, pool_rank))
+        meta = cached_meta(pool, progress=progress)
+        prices = {t: prices_all[t] for t in pool if t in prices_all}
+        rank = D.build_marketcap_rank(prices, meta)
+        return prices, meta, rank
+    return memo(("universe", int(pool_rank), END_STR), build)
+
+
+def load_dataset(p: Params, pool_rank: int, custom: str, box) -> Dataset:
+    bar = box.progress(0.0, text="טוען נתונים…")
+
+    def prog(x, msg):
+        bar.progress(min(max(x, 0.0), 1.0), text=msg)
+
+    bench = cached_bench()
+    if bench.get("spx") is None:
+        raise RuntimeError("לא ניתן היה להוריד את מדד ה-S&P 500 מ-Yahoo. נסה שוב בעוד רגע.")
+    if p.universe_mode == "custom":
+        tickers = tuple(sorted({t.strip().upper().replace(".", "-") for t in custom.replace("\n", ",").split(",") if t.strip()}))
+        if not tickers:
+            raise RuntimeError("לא הוזנו מניות.")
+        start = (pd.Timestamp(p.start) - pd.Timedelta(days=430)).date().isoformat()
+        prices = cached_prices(tickers, min(start, D.DATA_START), progress=prog)
+        meta = cached_meta(tuple(prices.keys()), progress=prog) if p.use_earnings else None
+        rank = None
     else:
-        total_actions = len(trades_df)
-        winning_actions = trades_df[trades_df['PnL_$'] > 0]
-        losing_actions = trades_df[trades_df['PnL_$'] <= 0]
-        
-        win_rate = (len(winning_actions) / total_actions) * 100.0
-        gross_profit = winning_actions['PnL_$'].sum()
-        gross_loss = abs(losing_actions['PnL_$'].sum())
-        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 99.0
-        
-        net_profit_usd = trades_df['PnL_$'].sum()
-        total_return_pct = (net_profit_usd / p_capital) * 100.0
-        
-        # מדדי סיכון מעקומת ההון
-        equity_df['Peak'] = equity_df['Equity'].cummax()
-        equity_df['Drawdown_USD'] = equity_df['Equity'] - equity_df['Peak']
-        equity_df['Drawdown_Pct'] = (equity_df['Drawdown_USD'] / equity_df['Peak']) * 100.0
-        max_dd_pct = equity_df['Drawdown_Pct'].min()
-        max_dd_usd = equity_df['Drawdown_USD'].min()
-        
-        # CAGR
-        days_total = max((equity_df['Date'].max() - equity_df['Date'].min()).days, 180)
-        years = days_total / 365.25
-        final_eq = equity_df['Equity'].iloc[-1]
-        cagr = (((final_eq / p_capital) ** (1.0 / years)) - 1.0) * 100.0 if final_eq > 0 else -100.0
-        
-        st.subheader("📋 תקציר מנהלים וביצועי ליבה (Executive Summary)")
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Win Rate (אחוז הצלחה)", f"{win_rate:.1f}%", f"{len(winning_actions)} מתוך {total_actions}")
-        k2.metric("Profit Factor (PF)", f"{profit_factor:.2f}", "יעד מוסדי > 3.5")
-        k3.metric("תשואה שנתית (CAGR)", f"{cagr:.1f}%", f"סה\"כ {total_return_pct:.1f}%")
-        k4.metric("Max Drawdown", f"{max_dd_pct:.1f}%", f"${abs(max_dd_usd):,.0f}")
-        k5.metric("זמן החזקה ממוצע", f"{trades_df['Days'].mean():.1f} ימים", f"עסקאות שנפתחו: {len(trades_df[trades_df['Stage'].str.contains('Stage 1')])}")
-        
-        st.divider()
+        prices, meta, rank = cached_universe(int(pool_rank), progress=prog)
+    peg = cached_peg(tuple(prices.keys())) if p.use_peg else {}
+    bar.empty()
+    return D.assemble_dataset(prices, bench, meta, rank, peg)
 
-        # עקומת הון
-        st.subheader("📈 עקומת צמיחת תיק ההשקעות (Portfolio Equity Curve)")
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=equity_df['Date'],
-            y=equity_df['Equity'],
-            mode='lines',
-            name='Portfolio Equity ($)',
-            line=dict(color='#00FFA3', width=2.5)
-        ))
-        fig.update_layout(
-            template="plotly_dark",
-            xaxis_title="תאריך",
-            yaxis_title="שווי תיק ($)",
-            height=450,
-            margin=dict(l=20, r=20, t=30, b=20)
-        )
-        st.plotly_chart(fig, use_container_width=True)
 
-        st.divider()
+# --------------------------------------------------------------------------------------
+# Sidebar: parameters
+# --------------------------------------------------------------------------------------
+st.sidebar.title("⚙️ פרמטרים")
+st.sidebar.selectbox("טען פריסט", ["— בחר —"] + list(PRESETS.keys()), key="preset", on_change=apply_preset)
 
-        # פילוח לפי שנים
-        st.subheader("📅 פילוח ביצועים לפי שנים")
-        trades_df['Exit_Year'] = pd.to_datetime(trades_df['Exit_Date']).dt.year
-        annual_summary = trades_df.groupby('Exit_Year').agg(
-            Actions=('PnL_$', 'count'),
-            Wins=('PnL_$', lambda x: (x > 0).sum()),
-            Net_PnL=('PnL_$', 'sum'),
-            Gross_Profit=('PnL_$', lambda x: x[x > 0].sum()),
-            Gross_Loss=('PnL_$', lambda x: abs(x[x <= 0].sum()))
-        ).reset_index()
-        
-        annual_summary['Win_Rate'] = (annual_summary['Wins'] / annual_summary['Actions']) * 100.0
-        annual_summary['Profit_Factor'] = np.where(
-            annual_summary['Gross_Loss'] > 0,
-            annual_summary['Gross_Profit'] / annual_summary['Gross_Loss'],
-            99.0
-        )
-        annual_summary['Return_on_Capital'] = (annual_summary['Net_PnL'] / p_capital) * 100.0
-        
-        st.dataframe(
-            annual_summary[['Exit_Year', 'Actions', 'Win_Rate', 'Profit_Factor', 'Net_PnL', 'Return_on_Capital']].style.format({
-                "Win_Rate": "{:.1f}%",
-                "Profit_Factor": "{:.2f}",
-                "Net_PnL": "${:,.2f}",
-                "Return_on_Capital": "{:.1f}%"
-            }),
-            use_container_width=True
-        )
+with st.sidebar.form("params"):
+    with st.expander("📅 תקופה ומאגר מניות", expanded=True):
+        st.date_input("תחילת סימולציה", key="start_d", min_value=dt.date(2016, 1, 4))
+        st.date_input("סוף סימולציה", key="end_d")
+        st.selectbox("מאגר", list(UNIVERSE_LABELS.keys()), key="universe_mode", format_func=UNIVERSE_LABELS.get)
+        st.number_input("N – כמה מהגדולות (לפי שווי שוק)", 5, 500, key="top_n", step=5)
+        st.number_input("גודל מאגר מועמדים (לפי מחזור מסחר)", 60, 200, key="pool_rank", step=10,
+                        help="מניות שהיו אי-פעם בין X הנסחרות ביותר. גדול יותר = טעינה איטית יותר, כיסוי טוב יותר.")
+        st.text_area("רשימת מניות (למצב 'רשימה שאבחר')", key="custom_tickers", height=70)
+        st.checkbox("הצג גם פיצול אימון/בדיקה", key="use_split")
+        st.date_input("תאריך פיצול (אימון עד, בדיקה אחריו)", key="split_d")
 
-        # לשוניות פירוט
-        tab_log, tab_stocks, tab_reasons = st.tabs(["📋 יומן פעולות מלא", "🏆 ביצועים לפי מניה", "🎯 התפלגות סיבות יציאה"])
-        
-        with tab_log:
-            st.dataframe(
-                trades_df[['Ticker', 'Entry_Date', 'Exit_Date', 'Stage', 'Entry_P', 'Exit_P', 'Return_%', 'PnL_$', 'Reason', 'Days']].sort_values(by='Exit_Date', ascending=False).style.format({
-                    "Entry_P": "${:.2f}",
-                    "Exit_P": "${:.2f}",
-                    "Return_%": "{:.2f}%",
-                    "PnL_$": "${:,.2f}"
-                }),
-                use_container_width=True
-            )
-            
-        with tab_stocks:
-            stock_summary = trades_df.groupby('Ticker').agg(
-                Actions=('PnL_$', 'count'),
-                Win_Rate=('PnL_$', lambda x: (x > 0).mean() * 100.0),
-                Total_PnL=('PnL_$', 'sum')
-            ).sort_values(by='Total_PnL', ascending=False)
-            
-            st.dataframe(
-                stock_summary.style.format({
-                    "Win_Rate": "{:.1f}%",
-                    "Total_PnL": "${:,.2f}"
-                }),
-                use_container_width=True
-            )
-            
-        with tab_reasons:
-            reasons = trades_df['Reason'].value_counts()
-            st.bar_chart(reasons)
+    with st.expander("🔎 תנאי כניסה", expanded=False):
+        st.checkbox("מדד S&P מעל SMA", key="use_index_filter")
+        st.slider("אורך SMA של המדד", 20, 250, key="index_sma")
+        st.checkbox("המניה מעל SMA", key="use_stock_sma")
+        st.slider("אורך SMA של המניה", 20, 250, key="stock_sma")
+        st.slider("תקופת RSI", 2, 30, key="rsi_period")
+        st.slider("RSI לכניסה – מתחת ל-", 10.0, 60.0, key="rsi_entry", step=1.0)
+        st.checkbox("נר פריקה = יום החצייה מתחת לסף (ולא כל יום מתחתיו)", key="require_cross")
+        st.checkbox("סינון PEG (משתמש בערך נוכחי – הטיית הסתכלות קדימה!)", key="use_peg")
+        c1, c2 = st.columns(2)
+        c1.number_input("PEG מינימום", -5.0, 10.0, key="peg_min", step=0.1)
+        c2.number_input("PEG מקסימום", -5.0, 10.0, key="peg_max", step=0.1)
+        st.checkbox("ללא דוחות בימים הקרובים", key="use_earnings")
+        st.slider("ימים קדימה (ימי לוח)", 1, 90, key="earnings_days")
+
+    with st.expander("🛒 פקודת כניסה", expanded=False):
+        st.radio("אופן כניסה", ["breakout", "next_open"], key="entry_mode", horizontal=True,
+                 format_func={"breakout": "Buy-stop מעל ה-high", "next_open": "פתיחת היום הבא"}.get)
+        st.number_input("באפר מעל ה-high ($)", 0.0, 5.0, key="buffer_usd", step=0.01, format="%.2f")
+        st.checkbox("תקרת קנייה מעל מחיר הכניסה", key="use_limit_cap")
+        st.number_input("תקרה (%)", 0.1, 10.0, key="limit_cap_pct", step=0.1)
+        st.slider("תוקף הפקודה (ימי מסחר)", 1, 10, key="order_days")
+        st.checkbox("להוריד את ה-high מדי יום אם ירד", key="reeval_lower_high")
+        st.checkbox("לבטל פקודה אם התנאים כבר לא מתקיימים", key="cancel_if_invalid")
+
+    with st.expander("🛡️ סיכון", expanded=False):
+        st.radio("סוג סטופ", ["fixed", "atr", "none"], key="stop_mode", horizontal=True,
+                 format_func={"fixed": "אחוז קבוע", "atr": "ATR", "none": "ללא"}.get)
+        st.number_input("סטופ קבוע (%)", 0.5, 50.0, key="stop_pct", step=0.5)
+        st.slider("תקופת ATR", 5, 30, key="atr_period")
+        st.number_input("מכפיל ATR", 0.5, 10.0, key="stop_atr_mult", step=0.5)
+        st.checkbox("בדיקת RVOL (פרוקסי: נפח יומי מלא)", key="use_rvol")
+        st.number_input("RVOL מינימום", 0.1, 3.0, key="rvol_min", step=0.1)
+        st.slider("חלון ממוצע נפח (ימים)", 5, 60, key="rvol_window")
+        st.checkbox("לבדוק RVOL בכל יום (ולא רק ביום הכניסה)", key="rvol_every_day")
+        st.number_input("סגירה בזמן: מקס' ימי החזקה (0 = כבוי)", 0, 250, key="max_hold_days", step=5)
+
+    with st.expander("🎯 יציאות", expanded=False):
+        st.slider("מימוש חלקי ב-RSI", 30.0, 90.0, key="tp1_rsi", step=1.0)
+        st.slider("חלק שנמכר במימוש הראשון", 0.1, 0.9, key="tp1_fraction", step=0.05)
+        st.checkbox("Break-even לחלק הנותר", key="use_breakeven")
+        st.slider("מימוש יתרה ב-RSI", 40.0, 95.0, key="tp2_rsi", step=1.0)
+        st.checkbox("יציאה בסגירה מתחת ל-EMA (ליתרה)", key="use_ema_exit")
+        st.slider("אורך EMA", 5, 100, key="ema_period")
+        st.radio("ביצוע יציאות לפי RSI", ["next_open", "same_close"], key="exec_mode", horizontal=True,
+                 format_func={"next_open": "פתיחת היום הבא", "same_close": "סגירה באותו יום"}.get)
+        st.number_input("עמלה+החלקה לצד (נקודות בסיס)", 0.0, 100.0, key="cost_bps", step=1.0)
+
+    with st.expander("💼 ניהול תיק", expanded=False):
+        st.number_input("הון התחלתי ($)", 1000.0, 1e9, key="initial_capital", step=10000.0)
+        st.number_input("גודל פוזיציה (% מההון)", 0.5, 100.0, key="position_pct", step=0.5)
+        st.number_input("מקסימום פוזיציות פתוחות", 1, 100, key="max_positions")
+        st.number_input("תקרת חשיפה ברוטו (% מההון; מעל 100 = מינוף)", 10.0, 400.0, key="max_gross_pct", step=10.0)
+        st.radio("ריבית על מזומן", ["tbill", "fixed", "zero"], key="cash_rate_mode", horizontal=True,
+                 format_func={"tbill": "מק\"מ אמיתי", "fixed": "קבועה", "zero": "אפס"}.get)
+        st.number_input("ריבית קבועה (% שנתי)", 0.0, 15.0, key="cash_rate_fixed", step=0.25)
+        st.number_input("מרווח ריבית על הלוואה (% שנתי)", 0.0, 10.0, key="borrow_spread_pct", step=0.25)
+
+    submitted = st.form_submit_button("▶️ הרץ סימולציה", width="stretch")
+
+
+# --------------------------------------------------------------------------------------
+# Run
+# --------------------------------------------------------------------------------------
+def pct(x, d=1):
+    return "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{100 * x:.{d}f}%"
+
+
+def run_simulation():
+    p = params_from_state()
+    problems = []
+    if p.end <= p.start:
+        problems.append("תאריך הסיום חייב להיות אחרי ההתחלה.")
+    if p.tp1_rsi >= p.tp2_rsi:
+        problems.append("RSI של המימוש הראשון צריך להיות נמוך מזה של המימוש השני.")
+    if p.universe_mode != "custom" and p.start < "2016-01-04":
+        problems.append("במאגר לפי שווי שוק נקודתי אפשר להתחיל מ-4.1.2016 (Yahoo מחזיק היסטוריית מספר מניות מ-2015).")
+    if problems:
+        for m in problems:
+            st.error(m)
+        return
+
+    box = st.empty()
+    try:
+        with st.spinner("טוען נתונים (בפעם הראשונה זה יכול לקחת כמה דקות; אחר כך הכול נשמר בזיכרון)…"):
+            ds = load_dataset(p, st.session_state["pool_rank"], st.session_state["custom_tickers"], box)
+        with st.spinner("מריץ סימולציה…"):
+            trades, counters = run_backtest(ds, p)
+            bench = cached_bench()
+            spx = bench["spx"]
+            days = spx.loc[p.start:p.end].index
+            if len(days) < 5:
+                st.error("אין מספיק ימי מסחר בתקופה שנבחרה.")
+                return
+            prev = spx.index[spx.index < days[0]]
+            base_day = prev[-1] if len(prev) else days[0]
+            rf = cash_rate_series(p, spx.loc[base_day:p.end].index, bench.get("irx"))
+            eq, expo, info = simulate_portfolio(trades, p, days, rf)
+            eq = pd.concat([pd.Series({base_day: p.initial_capital}), eq])
+            eq = eq[~eq.index.duplicated(keep="last")].sort_index()
+            btr = (bench.get("spxtr") if bench.get("spxtr") is not None else spx).loc[base_day:p.end]
+            btr = btr / btr.iloc[0] * p.initial_capital
+    except Exception as e:  # noqa: BLE001
+        box.empty()
+        st.error(f"שגיאה בטעינת נתונים או בהרצה: {e}")
+        return
+
+    if len(trades):
+        trades["mae"] = [min(v for _, v in pth) for pth in trades["path"]]
+    res = dict(p=p, trades=trades, counters=counters, equity=eq, exposure=expo, info=info, bench=btr, rf=rf,
+               stats=trade_stats(trades), m=curve_metrics(eq, rf), mb=curve_metrics(btr, rf),
+               ts=dt.datetime.now().strftime("%H:%M:%S"))
+    st.session_state["result"] = res
+    if len(trades):
+        s, m = res["stats"], res["m"]
+        st.session_state["history"].append({
+            "שעה": res["ts"], "תקופה": f"{p.start}→{p.end}", "מאגר": f"{p.universe_mode}:{p.top_n}",
+            "RSI כניסה": p.rsi_entry, "סטופ": p.stop_mode if p.stop_mode == "none" else (f"{p.stop_pct}%" if p.stop_mode == "fixed" else f"ATR×{p.stop_atr_mult}"),
+            "יציאות RSI": f"{p.tp1_rsi:.0f}/{p.tp2_rsi:.0f}", "RVOL": p.rvol_min if p.use_rvol else "כבוי",
+            "עסקאות": s["n"], "הצלחה%": round(100 * s["win_rate"], 1), "PF": round(s["profit_factor"], 2),
+            "CAGR%": round(100 * m.get("cagr", np.nan), 1), "MDD%": round(100 * m.get("mdd", np.nan), 1),
+            "Sharpe": round(m.get("sharpe", np.nan), 2),
+        })
+
+
+if submitted:
+    run_simulation()
+
+# --------------------------------------------------------------------------------------
+# Results
+# --------------------------------------------------------------------------------------
+st.title("📈 סימולטור אסטרטגיית פולבק RSI")
+
+res = st.session_state["result"]
+if res is None:
+    st.info("בחר פרמטרים בסרגל הצד (או טען פריסט) ולחץ **הרץ סימולציה**. הטעינה הראשונה מורידה נתוני אמת מ-Yahoo Finance ועשויה לקחת כמה דקות.")
+    st.stop()
+
+p: Params = res["p"]
+trades: pd.DataFrame = res["trades"]
+if len(trades) == 0:
+    st.warning("לא נמצאו עסקאות עם הפרמטרים האלה. נסה להרחיב תנאים (למשל RSI גבוה יותר, מאגר גדול יותר).")
+    st.stop()
+s, m, mb = res["stats"], res["m"], res["mb"]
+
+with st.expander("⚠️ מגבלות ואזהרות (חשוב לקרוא)", expanded=False):
+    w = [
+        "המאגר הוא חברות שנמצאות **היום** ב-S&P 500 (הטיית הישרדות): מניות שנפלו ויצאו מהמדד לא נכללות. הטיה זו משפרת במיוחד אסטרטגיות בלי סטופ.",
+        "אין נתוני PEG היסטוריים חינמיים. סינון PEG משתמש בערך של היום ולכן **אינו תקף לבק-טסט**.",
+        "אין נתוני דקה היסטוריים; RVOL מחושב מנפח יומי מלא מול ממוצע ימים קודמים (פרוקסי).",
+        "בנרות יומיים לא ידוע סדר האירועים בתוך היום. ההנחה: אם המחיר נגע בסטופ ביום הכניסה, העסקה נעצרה (שמרני). "
+        "אם הפתיחה מעל התקרה, אין מילוי באותו יום.",
+        "כל הרצה נוספת של פרמטרים היא ניסיון נוסף. **כוונון עד שהתוצאה נראית טוב מנפח את הביצועים**. השתמש בפיצול אימון/בדיקה ובהיסטוריית ההרצות.",
+        "מחירים מותאמים לפיצולים בלבד; דיבידנדים של המניות המוחזקות לא נכללים. המדד להשוואה הוא S&P 500 Total Return.",
+        "אין כאן ייעוץ השקעות.",
+    ]
+    if p.use_peg:
+        w.insert(0, "**סינון PEG פעיל** – התוצאות מוטות בגלל הסתכלות קדימה.")
+    if p.stop_mode == "none":
+        w.insert(0, "**אין סטופ**: אחוז ההצלחה וה-PF נראים גבוהים כי הפסדים לא ממומשים; בדוק את ה-MAE והעסקה הגרועה.")
+    if p.max_gross_pct > 100:
+        w.insert(0, "תקרת חשיפה מעל 100% = מינוף. לא מדומים מרג'ין קול או תנועות תוך-יומיות.")
+    if len(st.session_state["history"]) >= 20:
+        w.insert(0, f"הרצת {len(st.session_state['history'])} וריאציות – הסיכון ל-overfitting גבוה.")
+    for line in w:
+        st.markdown(f"- {line}")
+
+# ---- KPIs
+k = st.columns(4)
+k[0].metric("תשואה שנתית", pct(m["cagr"]), delta=f"מדד: {pct(mb['cagr'])}", delta_color="off")
+k[1].metric("תשואה מצטברת", pct(m["cumulative"], 0), delta=f"מדד: {pct(mb['cumulative'], 0)}", delta_color="off")
+k[2].metric("ירידה מקסימלית", pct(m["mdd"]), delta=f"מדד: {pct(mb['mdd'])}", delta_color="off")
+k[3].metric("Sharpe", f"{m['sharpe']:.2f}", delta=f"מדד: {mb['sharpe']:.2f}", delta_color="off")
+k = st.columns(4)
+k[0].metric("עסקאות", f"{s['n']}")
+k[1].metric("אחוז הצלחה", pct(s["win_rate"]))
+k[2].metric("Profit Factor", f"{s['profit_factor']:.2f}")
+k[3].metric("חשיפה ממוצעת", pct(res["exposure"].mean(), 0))
+
+tab_eq, tab_tr, tab_break, tab_split, tab_hist = st.tabs(["עקומת הון", "עסקאות", "פילוחים", "אימון/בדיקה", "היסטוריית הרצות"])
+
+# ---- equity curve
+with tab_eq:
+    logy = st.checkbox("סקאלה לוגריתמית", value=False)
+    eq, btr = res["equity"], res["bench"]
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28], vertical_spacing=0.04)
+    fig.add_trace(go.Scatter(x=eq.index, y=eq.values, name="אסטרטגיה", line=dict(width=2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=btr.index, y=btr.values, name="S&P 500 (Total Return)", line=dict(width=1.5, dash="dot")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=eq.index, y=(eq / eq.cummax() - 1) * 100, name="ירידה – אסטרטגיה", fill="tozeroy"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=btr.index, y=(btr / btr.cummax() - 1) * 100, name="ירידה – מדד", line=dict(dash="dot")), row=2, col=1)
+    fig.update_yaxes(type="log" if logy else "linear", row=1, col=1, title="שווי תיק ($)")
+    fig.update_yaxes(title="ירידה (%)", row=2, col=1)
+    fig.update_layout(height=560, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
+    st.plotly_chart(fig, width="stretch")
+
+    mt = pd.DataFrame({
+        "אסטרטגיה": [pct(m["cagr"]), pct(m["cumulative"], 0), pct(m["mdd"]), f"{m['sharpe']:.2f}", f"{m['sortino']:.2f}", f"{m['calmar']:.2f}", pct(m["vol"])],
+        "S&P 500 TR": [pct(mb["cagr"]), pct(mb["cumulative"], 0), pct(mb["mdd"]), f"{mb['sharpe']:.2f}", f"{mb['sortino']:.2f}", f"{mb['calmar']:.2f}", pct(mb["vol"])],
+    }, index=["תשואה שנתית", "מצטבר", "ירידה מקס'", "Sharpe (עודף על מק\"מ)", "Sortino", "Calmar", "תנודתיות שנתית"])
+    st.dataframe(mt, width="stretch")
+    yt = yearly_table(eq, btr)
+    st.markdown("**תשואה לפי שנה קלנדרית** (שנה ראשונה/אחרונה חלקיות)")
+    st.dataframe(yt.style.format("{:.1%}"), width="stretch")
+    st.caption(f"עסקאות שנכנסו לתיק: {res['info']['taken']} | דולגו בגלל מגבלות תיק (מס' פוזיציות/חשיפה): {res['info']['skipped']}")
+
+# ---- trades
+with tab_tr:
+    c = res["counters"]
+    st.markdown(
+        f"**מחזור חיי הפקודות:** נוצרו {c['created']} | מולאו {c['filled']} | פגו אחרי {p.order_days} ימים {c['expired']} | בוטלו (תנאים לא מתקיימים) {c['cancelled']} "
+        f"| ימים שדולגו כי הפתיחה מעל התקרה {c['nofill_gap']}"
+    )
+    a, b = st.columns(2)
+    stat_rows = {
+        "ממוצע לעסקה": pct(s["avg"], 2), "חציון": pct(s["median"], 2), "רווח ממוצע במנצחות": pct(s["avg_win"], 2),
+        "הפסד ממוצע במפסידות": pct(s["avg_loss"], 2), "העסקה הטובה / הגרועה": f"{pct(s['best'])} / {pct(s['worst'])}",
+        "החזקה ממוצעת / מקס' (ימים)": f"{s['avg_hold']:.1f} / {s['max_hold']}", "הגיעו למימוש חלקי": pct(s["reached_tp1"], 0),
+        "t-stat של הממוצע": f"{s['t_stat']:.2f}", "עברו דוחות בזמן ההחזקה": pct(s["through_earnings"], 0),
+        "MAE: ירדו >10% מתחת לכניסה": pct((trades["mae"] < -0.10).mean(), 0), "MAE: ירדו >20%": pct((trades["mae"] < -0.20).mean(), 0),
+    }
+    a.dataframe(pd.DataFrame({"ערך": stat_rows}), width="stretch")
+    lab = {"tp2_ema": "יעד RSI/EMA", "stop": "סטופ", "stop_gap": "פער מעל הסטופ", "breakeven": "Break-even", "rvol": "RVOL נמוך", "time": "זמן", "open_end": "פתוחה בסוף"}
+    rs = pd.Series(s["reasons"]).rename(index=lab)
+    b.dataframe(pd.DataFrame({"אחוז מהעסקאות": rs.map(lambda x: f"{100 * x:.1f}%")}), width="stretch")
+    h = go.Figure(go.Histogram(x=trades["ret"] * 100, nbinsx=50))
+    h.update_layout(height=280, margin=dict(l=10, r=10, t=30, b=10), title="התפלגות תשואה לעסקה (%)")
+    st.plotly_chart(h, width="stretch")
+    show = trades.drop(columns=["path"]).copy()
+    show["ret"] = (show["ret"] * 100).round(2)
+    show["mae"] = (show["mae"] * 100).round(2)
+    st.dataframe(show, width="stretch", height=360)
+    st.download_button("⬇️ הורד עסקאות (CSV)", show.to_csv(index=False).encode("utf-8-sig"), "trades.csv", "text/csv")
+    st.download_button("⬇️ הורד פרמטרים (JSON)", json.dumps(p.to_dict(), ensure_ascii=False, indent=2).encode("utf-8"), "params.json", "application/json")
+
+# ---- breakdowns
+with tab_break:
+    t2 = trades.copy()
+    t2["year"] = pd.to_datetime(t2["entry"]).dt.year
+
+    def agg(g):
+        r = g["ret"]
+        pf = r[r > 0].sum() / abs(r[r <= 0].sum()) if (r <= 0).any() and r[r <= 0].sum() != 0 else np.inf
+        return pd.Series({"עסקאות": len(r), "הצלחה": f"{100 * (r > 0).mean():.1f}%", "ממוצע": f"{100 * r.mean():.2f}%", "PF": round(pf, 2), "הגרועה": f"{100 * r.min():.1f}%"})
+
+    st.markdown("**לפי שנת כניסה**")
+    st.dataframe(t2.groupby("year").apply(agg), width="stretch")
+    st.markdown("**ריכוז לפי מניה (חמש המובילות ברווח המצטבר)**")
+    cc = t2.groupby("ticker")["ret"].agg(["count", "sum"]).sort_values("sum", ascending=False)
+    top5 = cc.head(5)
+    rest = t2[~t2["ticker"].isin(top5.index)]
+    top5 = top5.assign(**{"חלק מהרווח": (top5["sum"] / cc["sum"].sum()).map("{:.0%}".format)})
+    st.dataframe(top5.rename(columns={"count": "עסקאות", "sum": "סכום תשואות"}), width="stretch")
+    if len(rest):
+        rr = rest["ret"]
+        st.caption(f"בלי חמש אלה: {len(rr)} עסקאות, הצלחה {100 * (rr > 0).mean():.1f}%, ממוצע {100 * rr.mean():.2f}%, PF {rr[rr > 0].sum() / max(abs(rr[rr <= 0].sum()), 1e-9):.2f}")
+    st.markdown("**לפי אופן היציאה**")
+    st.dataframe(t2.groupby("reason").agg(עסקאות=("ret", "size"), ממוצע=("ret", lambda x: f"{100 * x.mean():.2f}%"), החזקה=("hold", "mean")).round(1), width="stretch")
+
+# ---- split
+with tab_split:
+    if not st.session_state["use_split"]:
+        st.info("סמן 'הצג גם פיצול אימון/בדיקה' בסרגל הצד והרץ שוב. כוונן פרמטרים רק על תקופת האימון, ובדוק פעם אחת על תקופת הבדיקה.")
+    else:
+        sd = pd.Timestamp(st.session_state["split_d"])
+        rows = {}
+        for nm, msk, sl in (("אימון", pd.to_datetime(trades["entry"]) <= sd, slice(None, sd)), ("בדיקה", pd.to_datetime(trades["entry"]) > sd, slice(sd, None))):
+            g = trades[msk]
+            e = res["equity"].loc[sl]
+            b_ = res["bench"].loc[sl]
+            if len(g) < 2 or len(e) < 5:
+                rows[nm] = {"הערה": "אין מספיק נתונים"}
+                continue
+            ss, mm, bb = trade_stats(g), curve_metrics(e, res["rf"]), curve_metrics(b_, res["rf"])
+            rows[nm] = {"עסקאות": ss["n"], "הצלחה": pct(ss["win_rate"]), "PF": f"{ss['profit_factor']:.2f}", "ממוצע לעסקה": pct(ss["avg"], 2),
+                        "העסקה הגרועה": pct(ss["worst"]), "CAGR אסטרטגיה": pct(mm["cagr"]), "CAGR מדד": pct(bb["cagr"]),
+                        "MDD אסטרטגיה": pct(mm["mdd"]), "MDD מדד": pct(bb["mdd"]), "Sharpe אסטרטגיה": f"{mm['sharpe']:.2f}", "Sharpe מדד": f"{bb['sharpe']:.2f}"}
+        st.dataframe(pd.DataFrame(rows), width="stretch")
+        st.caption("שים לב: אם הפרמטרים כוונו תוך כדי הסתכלות על תקופת הבדיקה, היא כבר לא בדיקה חיצונית.")
+
+# ---- history
+with tab_hist:
+    hist = pd.DataFrame(st.session_state["history"])
+    st.markdown(f"**מספר ההרצות בסשן זה: {len(hist)}.** ככל שהוא גדל, ההסתברות למצוא תוצאה יפה במקרה גדלה.")
+    if len(hist):
+        st.dataframe(hist, width="stretch")
+        st.download_button("⬇️ הורד היסטוריה (CSV)", hist.to_csv(index=False).encode("utf-8-sig"), "runs.csv", "text/csv")
+        if st.button("נקה היסטוריה"):
+            st.session_state["history"] = []
+            st.rerun()
