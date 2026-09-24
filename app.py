@@ -299,11 +299,17 @@ if run_button:
                         return 'color: #ff5555'
                     return ''
 
+                # תמיכה ב-map החדש של pandas תוך תאימות לאחור (מונע את שגיאת applymap)
+                style_styler = trades_df.style
+                if hasattr(style_styler, "map"):
+                    styled_df = style_styler.map(color_status, subset=['Status'])
+                else:
+                    styled_df = style_styler.applymap(color_status, subset=['Status'])
+
                 st.dataframe(
-                    trades_df.style.applymap(color_status, subset=['Status']),
+                    styled_df,
                     use_container_width=True,
                     height=350
                 )
             else:
                 st.info("לא נוצרו איתותים בטווח התאריכים והפרמטרים שנבחרו.")
-              
